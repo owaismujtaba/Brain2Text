@@ -1,0 +1,10 @@
+paths:
+  data_dir: "/home/owais/Desktop/work/Brain2Text/data/features"
+
+dataset:
+  batch_size: 32
+  num_workers: 2
+
+training:
+  num_epochs: 10
+  learning_rate: 0.001
