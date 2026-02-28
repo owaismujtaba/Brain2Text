@@ -29,58 +29,64 @@ class ProcessedDataset(Dataset):
             sample = self.transform(sample)
         return sample
 
-def collate_fn(batch):
-    """
-    Groups samples into a batch, padding sequences to the max length in the batch.
-    """
-    # 1. Handle Tensors that need padding (EEG and Audio)
-    # We use batch_first=True to get [Batch, Seq_Len, Dim]
-    audio_embs = [item['audio_encoder_emb'] for item in batch]
-    eeg_signals = [item['eeg'] for item in batch]
-    eeg_lengths = [eeg.shape[0] for eeg in eeg_signals]  # Get original lengths for potential masking
-    eeg_padded = pad_sequence(eeg_signals, batch_first=True, padding_value=0.0)
+    def collate_fn(self, batch):
+        """
+        Groups samples into a batch, padding sequences to the max length in the batch.
+        """
+        # 1. Handle Tensors that need padding (EEG and Audio)
+        # We use batch_first=True to get [Batch, Seq_Len, Dim]
+        audio_embs = [item['audio_encoder_emb'] for item in batch]
+        eeg_signals = [item['eeg'] for item in batch]
+        eeg_lengths = [eeg.shape[0] for eeg in eeg_signals]  # Get original lengths for potential masking
+        eeg_padded = pad_sequence(eeg_signals, batch_first=True, padding_value=0.0)
 
-    # 2. Handle simple scalars or pre-calculated lengths
-    # These can be wrapped in a standard torch.tensor
-    n_frames = torch.tensor([item['n_actual_frames'] for item in batch])
+        # 2. Handle simple scalars or pre-calculated lengths
+        # These can be wrapped in a standard torch.tensor
+        n_frames = torch.tensor([item['n_actual_frames'] for item in batch])
 
-    # 3. Handle non-tensor data (like raw text strings)
-    texts = [item['text'] for item in batch]
-    return {
-        "audio_encoder_emb": torch.stack(audio_embs).squeeze(1),
-        "eeg": torch.tensor(eeg_padded),
-        "eeg_lengths": torch.tensor(eeg_lengths),
-        "n_actual_frames": torch.tensor(n_frames),
-        "text": texts
-    }
+        # 3. Handle non-tensor data (like raw text strings)
+        texts = [item['text'] for item in batch]
+        return {
+            "audio_encoder_emb": torch.stack(audio_embs).squeeze(1),
+            "eeg": torch.tensor(eeg_padded),
+            "eeg_lengths": torch.tensor(eeg_lengths),
+            "n_actual_frames": torch.tensor(n_frames),
+            "text": texts
+        }
 
-def get_dataloader(config, kind='train'):
+def get_dataloader(config):
     batch_size = config['training']['batch_size']
     num_workers = config['training']['num_workers']
     
-    dataset = ProcessedDataset(config, kind=kind)
-    
-    # Pass the collate_fn here
-    dataloader = DataLoader(
-        dataset, 
+    train_ds = ProcessedDataset(config, kind='train')
+    train_ds_loader = DataLoader(
+        train_ds, 
         batch_size=batch_size, 
-        shuffle=(kind == 'train'), 
+        shuffle=True, 
         num_workers=num_workers,
-        collate_fn=collate_fn
+        collate_fn=train_ds.collate_fn
+    )
+    val_ds = ProcessedDataset(config, kind='val')
+    val_ds_loader = DataLoader(
+        val_ds, 
+        batch_size=batch_size, 
+        shuffle=False, 
+        num_workers=num_workers,
+        collate_fn=val_ds.collate_fn
     )
     
-    return dataloader
-
+    
+    return train_ds_loader, val_ds_loader
 if __name__ == "__main__":
     from utils import load_config
     config = load_config("config.yaml")
-    train_loader = get_dataloader(config, kind='train')
-    val_loader = get_dataloader(config, kind='val')
-
+    train_loader, val_loader = get_dataloader(config)
+    
     # Example: Iterate through the training dataloader
     for batch in train_loader:
         print(batch['audio_encoder_emb'].shape)  # Should be [Batch, Seq_Len, Dim]
         print(batch['eeg'].shape)  # Should be [Batch, Seq_Len, Dim]
         print(batch['n_actual_frames'].shape)  # Should be [Batch]
+        print(batch['eeg_lengths'].shape)  # Should be [Batch]
         print(batch['text'])  # List of raw text strings
         break  # Just to check one batch
