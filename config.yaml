@@ -1,10 +1,18 @@
 paths:
-  data_dir: "/home/owais/Desktop/work/Brain2Text/data/features"
+  data_dir: "/workspace/work/BrainWhisper/data/raw/hdf5_data_final/"
+  processed_dir: "data/processed"
 
-dataset:
-  batch_size: 32
-  num_workers: 2
+audio:
+  tts_model: "tts_models/en/ljspeech/tacotron2-DDC"
+
+embedding:
+    model: 'base'
 
 training:
-  num_epochs: 10
+  batch_size: 4
+  num_epochs: 100
   learning_rate: 0.001
+  weight_decay: 0.0001
+  num_workers: 0  
+  device: "cuda"  # or "cpu"
+
