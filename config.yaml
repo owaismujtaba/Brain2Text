@@ -1,18 +1,61 @@
-paths:
-  data_dir: "/workspace/work/BrainWhisper/data/raw/hdf5_data_final/"
-  processed_dir: "data/processed"
 
-audio:
-  tts_model: "tts_models/en/ljspeech/tacotron2-DDC"
+workflow:
+  steps:
+    - generate_audio
+    - extract_features
+    - train
 
-embedding:
-    model: 'base'
+# ── Stage 1: Audio Generation (StyleTTS2) ───────────────────
+generate_audio:
+  data_dir: data/raw/hdf5_data_final
+  output_dir: data/generated_audio
+  split: train                # "train" or "val"
+  num_workers: 4
+  threads_per_worker: 1
 
-training:
-  batch_size: 4
-  num_epochs: 100
-  learning_rate: 0.001
-  weight_decay: 0.0001
-  num_workers: 0  
-  device: "cuda"  # or "cpu"
+# ── Stage 2: Whisper Feature Extraction ─────────────────────
+extract_features:
+  audio_dir: data/generated_audio
+  output_dir: data/features
+  num_workers: 8
+  threads_per_worker: 2
 
+# ── Stage 3: Training ──────────────────────────────────────
+train:
+  raw_dir: data/raw/hdf5_data_final
+  features_dir: data/features
+  epochs: 1000
+  batch_size: 32
+  lr: 3.0e-4
+  weight_decay: 1.0e-3      # stronger L2 to fight the train/val gap (was 1e-4)
+  num_workers: 1
+  conv_channels: 256
+  hidden: 256
+  gru_layers: 3             # smaller temporal model — 8 layers memorised (was 8)
+  dropout: 0.3              # back to the model's design default (was 0.1)
+  dec_loss_weight: 0.8      # decoder-in-the-loop CE loss weight (0 = off; try 0.5-1.0)
+  dec_model: tiny.en        # frozen Whisper model used for the decoder loss
+  ckpt_dir: checkpoints
+  wer_every: 5              # run WER eval every N epochs (0 = off)
+  wer_trials: 200           # honest WER estimate for checkpoint selection (was 30)
+  # ── neural-input regularisation (dataset.py) ──
+  normalize: true           # per-session, per-channel z-scoring of neural input
+  augment: true             # train-only augmentation (noise / channel-drop / scale / jitter)
+  aug_noise_std: 0.15       # Gaussian noise stddev (on normalised features)
+  aug_channel_drop: 0.1     # fraction of the 512 channels zeroed per trial
+  aug_scale: 0.1            # amplitude jitter: multiply by 1 +/- this
+  aug_time_jitter: 2        # random temporal shift in bins (+/-)
+  limit: 0                  # cap trials per split for debugging (0 = no cap)
+  device: auto                # "auto", "cuda", or "cpu"
+
+# ── Stage 4: Decoding / WER evaluation ─────────────────────
+decode:
+  ckpt: checkpoints/best_wer.pt   # checkpoint to decode with
+  split: val                      # "train" or "val"
+  raw_dir: data/raw/hdf5_data_final
+  features_dir: data/features
+  beam_size: 5                    # beam width (1 = greedy)
+  dec_model: tiny.en              # frozen Whisper model for decoding
+  limit: 0                        # cap trials (0 = decode all)
+  out: results/val_wer.csv        # per-trial WER output CSV
+  device: auto                    # "auto", "cuda", or "cpu"
