@@ -2,23 +2,16 @@ import os
 import torch
 import torchaudio
 from pathlib import Path
-import logging
 from typing import Dict, Any
-from utils import load_config
 import whisper
-import pdb
 from tqdm import tqdm
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler("logs/embedding_processing.log"),
-        logging.StreamHandler()
-    ]
-)
+try:
+    from utils import load_config, create_logger
+except ImportError:
+    from src.utils import load_config, create_logger
 
-logger = logging.getLogger("EmbeddingGenerator")
+logger = create_logger("embedding_processing")
 
 
 class EmbeddingGenerator:

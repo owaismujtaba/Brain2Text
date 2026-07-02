@@ -1,21 +1,32 @@
 import os
+import random
 import argparse
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+
+def set_seed(seed: int):
+    """Seed Python, NumPy and Torch RNGs for reproducible runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 try:
     from dataset import NeuralToEmbeddingDataset, collate, N_CTX, EMB_DIM
     from model import ConvBiGRU, masked_embedding_loss
     from decoder_loss import WhisperDecoderLoss
-    from decode import decode_dataset
+    from decode import decode_dataset, write_wer_reports
     from utils import create_logger
 except ImportError:
     from src.dataset import NeuralToEmbeddingDataset, collate, N_CTX, EMB_DIM
     from src.model import ConvBiGRU, masked_embedding_loss
     from src.decoder_loss import WhisperDecoderLoss
-    from src.decode import decode_dataset
+    from src.decode import decode_dataset, write_wer_reports
     from src.utils import create_logger
 
 logger = create_logger("train_neural2emb")
@@ -65,10 +76,24 @@ def run_epoch(model, loader, device, optimizer=None, dec_loss=None, dec_weight=0
     return tot / n, tot_l1 / n, tot_cos / n, tot_dec / n
 
 
-def eval_wer(model, dataset, device, n_trials=1450, model_name="tiny.en", beam_size=5):
-    """Beam-search decode with English normalization; returns (wer, exact, samples)."""
+def eval_wer(model, dataset, device, n_trials=1450, model_name="tiny.en",
+             beam_size=5, wmodel=None, epoch=None, out_dir=None):
+    """Beam-search decode with English normalization; returns (wer, exact, samples).
+
+    Pass ``wmodel`` to reuse an already-loaded frozen Whisper model instead of
+    reloading it from disk on every eval. When ``out_dir`` is given, write two
+    CSVs tagged by ``epoch``: per-trial (session, trial, actual, predicted, wer)
+    and per-session mean WER.
+    """
     mw, em, rows = decode_dataset(model, dataset, device, beam_size=beam_size,
-                                  limit=n_trials, model_name=model_name)
+                                  limit=n_trials, model_name=model_name, wmodel=wmodel)
+    if out_dir:
+        tag = f"epoch{epoch:04d}" if epoch is not None else "latest"
+        pred_path, session_path = write_wer_reports(
+            rows,
+            os.path.join(out_dir, f"val_predictions_{tag}.csv"),
+            os.path.join(out_dir, f"val_wer_per_session_{tag}.csv"))
+        logger.info(f"           wrote per-trial -> {pred_path} | per-session -> {session_path}")
     samples = [(r["truth"], r["pred"]) for r in rows[:5]]
     return mw, em, samples
 
@@ -77,8 +102,12 @@ def train(args):
     os.makedirs(args.ckpt_dir, exist_ok=True)
     device = args.device
 
+    seed = int(getattr(args, "seed", 42))
+    set_seed(seed)
+
     logger.info("=" * 60)
     logger.info("Training neural -> Whisper-embedding model")
+    logger.info(f"seed: {seed}")
     logger.info(f"TRAINING DEVICE: {device}  ->  {describe_device(device)}")
     logger.info(f"config: {vars(args)}")
 
@@ -89,12 +118,14 @@ def train(args):
         aug_scale=getattr(args, "aug_scale", 0.1),
         aug_time_jitter=getattr(args, "aug_time_jitter", 2),
     )
+    stats_dir = getattr(args, "stats_dir", None) or None
     train_ds = NeuralToEmbeddingDataset(
         args.raw_dir, args.features_dir, "train",
-        normalize=norm, augment=bool(getattr(args, "augment", True)), **aug_kw)
+        normalize=norm, augment=bool(getattr(args, "augment", True)),
+        stats_dir=stats_dir, **aug_kw)
     val_ds = NeuralToEmbeddingDataset(
         args.raw_dir, args.features_dir, "val",
-        normalize=norm, augment=False)
+        normalize=norm, augment=False, stats_dir=stats_dir)
     logger.info(f"neural input: normalize={norm} | train augment="
                 f"{bool(getattr(args, 'augment', True))} ({aug_kw})")
     if args.limit:
@@ -182,8 +213,14 @@ def train(args):
             logger.info(f"           new best val loss {best_val:.4f} -> saved {p}")
 
         if args.wer_every and epoch % args.wer_every == 0:
+            # Reuse the frozen Whisper already held by the decoder loss (same
+            # model name) to avoid reloading it from disk on every WER eval.
+            wmodel = dec_loss.model if dec_loss is not None else None
             mw, em, samples = eval_wer(model, val_ds, device, args.wer_trials,
-                                       beam_size=getattr(args, "beam_size", 5))
+                                       model_name=getattr(args, "dec_model", "tiny.en"),
+                                       beam_size=getattr(args, "beam_size", 5),
+                                       wmodel=wmodel, epoch=epoch,
+                                       out_dir=getattr(args, "wer_out_dir", "results/wer_eval"))
             logger.info(f"           WER {mw:.4f} | exact {em*100:.1f}% "
                         f"(over {args.wer_trials} val trials)")
             for truth, pred in samples[:3]:
@@ -206,6 +243,8 @@ def main():
     p = argparse.ArgumentParser(description="Train neural->Whisper-embedding model")
     p.add_argument("--raw_dir", default="data/raw/hdf5_data_final")
     p.add_argument("--features_dir", default="data/features")
+    p.add_argument("--stats_dir", default="", help="dir for the per-session "
+                   "normalization cache (default: <features_dir>/session_stats)")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -229,8 +268,11 @@ def main():
     p.add_argument("--dec_model", default="tiny.en", help="frozen Whisper model for decoder loss")
     p.add_argument("--wer_every", type=int, default=5, help="run WER eval every N epochs (0=off)")
     p.add_argument("--wer_trials", type=int, default=30)
+    p.add_argument("--wer_out_dir", default="results/wer_eval",
+                   help="dir for per-validation WER CSVs (per-trial + per-session)")
     p.add_argument("--beam_size", type=int, default=5, help="beam width for WER decoding (1=greedy)")
     p.add_argument("--limit", type=int, default=0, help="cap trials per split (debug)")
+    p.add_argument("--seed", type=int, default=42, help="RNG seed for reproducibility")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     train(p.parse_args())
 

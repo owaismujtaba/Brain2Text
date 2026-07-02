@@ -19,14 +19,18 @@ def valid_frames(audio_length):
     return max(1, min(N_CTX, math.ceil(int(audio_length) / FRAME_SAMPLES)))
 
 
-def _session_stats(raw_dir, features_dir, session):
+def _session_stats(raw_dir, features_dir, session, stats_dir=None):
     """Per-channel (mean, std) of neural input for *session*, cached to disk.
 
     Stats are always computed from the session's ``data_train.hdf5`` so the
     same normalisation is applied to its train and val trials without leaking
     val statistics. Returns two float32 arrays of shape (NEURAL_DIM,).
+
+    The cache is written under *stats_dir* when given, otherwise under
+    ``features_dir/session_stats``. Use *stats_dir* to keep the cache local
+    when ``features_dir`` points at a shared, read-only dataset.
     """
-    cache_dir = os.path.join(features_dir, STATS_DIRNAME)
+    cache_dir = stats_dir if stats_dir else os.path.join(features_dir, STATS_DIRNAME)
     os.makedirs(cache_dir, exist_ok=True)
     cache = os.path.join(cache_dir, f"{session}.npz")
     if os.path.exists(cache):
@@ -80,10 +84,11 @@ class NeuralToEmbeddingDataset(Dataset):
                  features_dir="data/features", split="train",
                  normalize=True, augment=False,
                  aug_noise_std=0.15, aug_channel_drop=0.1,
-                 aug_scale=0.1, aug_time_jitter=2):
+                 aug_scale=0.1, aug_time_jitter=2, stats_dir=None):
         self.raw_dir = raw_dir
         self.features_dir = features_dir
         self.split = split
+        self.stats_dir = stats_dir
         self.normalize = normalize
         self.augment = augment
         self.aug_noise_std = float(aug_noise_std)
@@ -110,7 +115,8 @@ class NeuralToEmbeddingDataset(Dataset):
         self._stats = {}
         if self.normalize:
             for session in sorted({s for s, _, _ in self.index}):
-                self._stats[session] = _session_stats(raw_dir, features_dir, session)
+                self._stats[session] = _session_stats(
+                    raw_dir, features_dir, session, self.stats_dir)
 
         # per-worker file-handle cache (built lazily after fork/spawn)
         self._cache = None

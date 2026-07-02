@@ -1,4 +1,9 @@
 
+# The raw HDF5 dataset and pre-extracted Whisper features live in the shared
+# NJEM project and are read-only from here. Anything this project WRITES
+# (stats cache, generated audio, features, checkpoints, results) stays local so
+# the NJEM copy is never modified.
+
 workflow:
   steps:
     - generate_audio
@@ -7,23 +12,24 @@ workflow:
 
 # ── Stage 1: Audio Generation (StyleTTS2) ───────────────────
 generate_audio:
-  data_dir: data/raw/hdf5_data_final
-  output_dir: data/generated_audio
+  data_dir: /raid/owais/home/work/NJEM/data/raw/hdf5_data_final   # read-only input
+  output_dir: data/generated_audio                                # local write
   split: train                # "train" or "val"
   num_workers: 4
   threads_per_worker: 1
 
 # ── Stage 2: Whisper Feature Extraction ─────────────────────
 extract_features:
-  audio_dir: data/generated_audio
-  output_dir: data/features
+  audio_dir: data/generated_audio        # local (produced by Stage 1)
+  output_dir: data/features              # local write
   num_workers: 8
   threads_per_worker: 2
 
 # ── Stage 3: Training ──────────────────────────────────────
 train:
-  raw_dir: data/raw/hdf5_data_final
-  features_dir: data/features
+  raw_dir: /raid/owais/home/work/NJEM/data/raw/hdf5_data_final   # read-only input
+  features_dir: /raid/owais/home/work/NJEM/data/features         # read-only input
+  stats_dir: data_cache/session_stats   # LOCAL normalization cache (not shared with NJEM)
   epochs: 1000
   batch_size: 32
   lr: 3.0e-4
@@ -38,6 +44,7 @@ train:
   ckpt_dir: checkpoints
   wer_every: 5              # run WER eval every N epochs (0 = off)
   wer_trials: 200           # honest WER estimate for checkpoint selection (was 30)
+  wer_out_dir: results/wer_eval   # per-validation CSVs: per-trial + per-session WER
   # ── neural-input regularisation (dataset.py) ──
   normalize: true           # per-session, per-channel z-scoring of neural input
   augment: true             # train-only augmentation (noise / channel-drop / scale / jitter)
@@ -46,14 +53,16 @@ train:
   aug_scale: 0.1            # amplitude jitter: multiply by 1 +/- this
   aug_time_jitter: 2        # random temporal shift in bins (+/-)
   limit: 0                  # cap trials per split for debugging (0 = no cap)
+  seed: 42                  # RNG seed for reproducible runs
   device: auto                # "auto", "cuda", or "cpu"
 
 # ── Stage 4: Decoding / WER evaluation ─────────────────────
 decode:
   ckpt: checkpoints/best_wer.pt   # checkpoint to decode with
   split: val                      # "train" or "val"
-  raw_dir: data/raw/hdf5_data_final
-  features_dir: data/features
+  raw_dir: /raid/owais/home/work/NJEM/data/raw/hdf5_data_final   # read-only input
+  features_dir: /raid/owais/home/work/NJEM/data/features         # read-only input
+  stats_dir: data_cache/session_stats   # LOCAL normalization cache (must match train)
   beam_size: 5                    # beam width (1 = greedy)
   dec_model: tiny.en              # frozen Whisper model for decoding
   limit: 0                        # cap trials (0 = decode all)

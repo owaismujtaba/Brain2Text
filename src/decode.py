@@ -64,6 +64,7 @@ def decode_dataset(model, dataset, device, beam_size=5, limit=0,
     norm = _normalizer()
     model.eval()
 
+    index = getattr(dataset, "index", None)   # [(session, trial, audio_length), ...]
     n = len(dataset) if not limit else min(limit, len(dataset))
     rows, wers, exact = [], [], 0
     for i in range(n):
@@ -78,9 +79,40 @@ def decode_dataset(model, dataset, device, beam_size=5, limit=0,
         w = wer(nt, np_)
         wers.append(w)
         exact += int(nt == np_)
-        rows.append({"idx": i, "wer": round(w, 4), "truth": truth, "pred": text})
+        session, trial = (index[i][0], index[i][1]) if index is not None else ("", i)
+        rows.append({"idx": i, "session": session, "trial": trial,
+                     "wer": round(w, 4), "truth": truth, "pred": text})
     mean_wer = sum(wers) / max(len(wers), 1)
     return mean_wer, exact / max(len(wers), 1), rows
+
+
+def write_wer_reports(rows, pred_path, session_path):
+    """Write two CSVs from decode_dataset `rows`:
+
+      * pred_path    -> session, trial, actual, predicted, wer   (per trial)
+      * session_path -> session, wer, n_trials                   (mean WER per session)
+    """
+    from collections import defaultdict
+
+    os.makedirs(os.path.dirname(pred_path) or ".", exist_ok=True)
+    with open(pred_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["session", "trial", "actual", "predicted", "wer"])
+        w.writeheader()
+        for r in rows:
+            w.writerow({"session": r.get("session", ""), "trial": r.get("trial", ""),
+                        "actual": r["truth"], "predicted": r["pred"], "wer": r["wer"]})
+
+    per_session = defaultdict(list)
+    for r in rows:
+        per_session[r.get("session", "")].append(r["wer"])
+    os.makedirs(os.path.dirname(session_path) or ".", exist_ok=True)
+    with open(session_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["session", "wer", "n_trials"])
+        for session in sorted(per_session):
+            vals = per_session[session]
+            w.writerow([session, round(sum(vals) / len(vals), 4), len(vals)])
+    return pred_path, session_path
 
 
 def decode(args):
@@ -97,20 +129,20 @@ def decode(args):
     logger.info(f"loaded model (epoch {ckpt.get('epoch')}, gru_layers {a['gru_layers']})")
 
     norm = bool(a.get("normalize", True))   # must match how the model was trained
+    stats_dir = getattr(args, "stats_dir", None) or None
     ds = NeuralToEmbeddingDataset(args.raw_dir, args.features_dir, args.split,
-                                  normalize=norm, augment=False)
+                                  normalize=norm, augment=False, stats_dir=stats_dir)
     logger.info(f"{args.split} trials: {len(ds)} (decoding {args.limit or len(ds)}) | normalize={norm}")
 
     mw, em, rows = decode_dataset(model, ds, device, beam_size=args.beam_size,
                                   limit=args.limit, model_name=args.dec_model)
 
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["idx", "wer", "truth", "pred"])
-        w.writeheader()
-        w.writerows(rows)
+    base, ext = os.path.splitext(args.out)
+    session_out = f"{base}_per_session{ext or '.csv'}"
+    write_wer_reports(rows, args.out, session_out)
 
-    logger.info(f"WER {mw:.4f} | exact {em*100:.1f}% | wrote {len(rows)} decodings -> {args.out}")
+    logger.info(f"WER {mw:.4f} | exact {em*100:.1f}% | wrote {len(rows)} decodings -> "
+                f"{args.out} | per-session WER -> {session_out}")
     for r in rows[:8]:
         logger.info(f"  [{r['wer']:.2f}] truth: {r['truth']}")
         logger.info(f"          pred : {r['pred']}")
