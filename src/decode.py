@@ -12,11 +12,11 @@ import torch
 
 try:
     from dataset import NeuralToEmbeddingDataset, N_CTX, EMB_DIM
-    from model import ConvBiGRU
+    from model import build_model, load_checkpoint_weights
     from utils import create_logger
 except ImportError:
     from src.dataset import NeuralToEmbeddingDataset, N_CTX, EMB_DIM
-    from src.model import ConvBiGRU
+    from src.model import build_model, load_checkpoint_weights
     from src.utils import create_logger
 
 logger = create_logger("decode")
@@ -123,10 +123,10 @@ def decode(args):
 
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     a = ckpt["args"]
-    model = ConvBiGRU(conv_channels=a.get("conv_channels", 256), hidden=a["hidden"],
-                      gru_layers=a["gru_layers"], dropout=a["dropout"]).to(device)
-    model.load_state_dict(ckpt["model"])
-    logger.info(f"loaded model (epoch {ckpt.get('epoch')}, gru_layers {a['gru_layers']})")
+    model = build_model(a).to(device)   # rebuilds the exact ablation architecture from stored args
+    load_checkpoint_weights(model, ckpt["model"])
+    logger.info(f"loaded model (epoch {ckpt.get('epoch')}, rnn={model.rnn_type}, "
+                f"aligner={model.aligner}, conv_layers={model.conv_layers})")
 
     norm = bool(a.get("normalize", True))   # must match how the model was trained
     stats_dir = getattr(args, "stats_dir", None) or None

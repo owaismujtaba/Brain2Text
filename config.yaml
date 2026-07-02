@@ -27,23 +27,40 @@ extract_features:
 
 # ── Stage 3: Training ──────────────────────────────────────
 train:
-  raw_dir: /raid/owais/home/work/NJEM/data/raw/hdf5_data_final   # read-only input
-  features_dir: /raid/owais/home/work/NJEM/data/features         # read-only input
+  raw_dir: /workspace/work/NJEM/data/raw/hdf5_data_final   # read-only input
+  features_dir: /workspace/work/NJEM/data/features         # read-only input
   stats_dir: data_cache/session_stats   # LOCAL normalization cache (not shared with NJEM)
   epochs: 1000
-  batch_size: 32
+  batch_size: 64
   lr: 3.0e-4
   weight_decay: 1.0e-3      # stronger L2 to fight the train/val gap (was 1e-4)
-  num_workers: 1
+  num_workers: 2
+  # ── model architecture (all ablatable; override per run, e.g.
+  #    `python main.py train --rnn_type lstm --bidirectional false
+  #     --ckpt_dir checkpoints/abl_lstm`) ──
   conv_channels: 256
+  conv_layers: 2            # number of stride-2 conv blocks (time subsample = 2^L)
+  conv_kernel: 5            # conv kernel size
+  rnn_type: gru             # temporal model: gru | lstm | none
   hidden: 256
-  gru_layers: 3             # smaller temporal model — 8 layers memorised (was 8)
+  rnn_layers: 3             # GRU/LSTM depth (alias of the old gru_layers)
+  bidirectional: true       # bi- vs uni-directional RNN
+  aligner: attn             # length aligner: attn (cross-attn) | interp (interpolation)
+  attn_heads: 4             # heads for the cross-attention aligner
+  head_layers: 2            # MLP regression-head depth
   dropout: 0.3              # back to the model's design default (was 0.1)
-  dec_loss_weight: 0.8      # decoder-in-the-loop CE loss weight (0 = off; try 0.5-1.0)
+  # ── loss term weights (set to 0 to ablate a term) ──
+  l1_weight: 1.0            # SmoothL1 embedding-regression weight
+  cos_weight: 1.0           # (1 - cosine) weight
+  dec_loss_weight: 0.8      # decoder-in-the-loop loss weight (0 = off; try 0.5-1.0)
+  dec_distill_weight: 0.5   # within the decoder loss, blend of soft KL vs hard CE (0=CE only, 1=KL only)
+  dec_temperature: 2.0      # softmax temperature for the distillation KL
+  dec_ramp_epochs: 20       # linearly ramp the decoder-loss weight 0->dec_loss_weight over N epochs (0=off)
   dec_model: tiny.en        # frozen Whisper model used for the decoder loss
   ckpt_dir: checkpoints
+  early_stop_patience: 10   # stop if val loss doesn't improve for N epochs (0 = off)
   wer_every: 5              # run WER eval every N epochs (0 = off)
-  wer_trials: 200           # honest WER estimate for checkpoint selection (was 30)
+  wer_trials: 1425          # honest WER estimate for checkpoint selection (was 30)
   wer_out_dir: results/wer_eval   # per-validation CSVs: per-trial + per-session WER
   # ── neural-input regularisation (dataset.py) ──
   normalize: true           # per-session, per-channel z-scoring of neural input
@@ -60,8 +77,8 @@ train:
 decode:
   ckpt: checkpoints/best_wer.pt   # checkpoint to decode with
   split: val                      # "train" or "val"
-  raw_dir: /raid/owais/home/work/NJEM/data/raw/hdf5_data_final   # read-only input
-  features_dir: /raid/owais/home/work/NJEM/data/features         # read-only input
+  raw_dir: /workspace/work/NJEM/data/raw/hdf5_data_final   # read-only input
+  features_dir: /workspace/work/NJEM/data/features         # read-only input
   stats_dir: data_cache/session_stats   # LOCAL normalization cache (must match train)
   beam_size: 5                    # beam width (1 = greedy)
   dec_model: tiny.en              # frozen Whisper model for decoding
