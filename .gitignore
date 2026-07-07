@@ -26,7 +26,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 features/
-data/
+/data/
 data_cache/
 logs/
 checkpoints
