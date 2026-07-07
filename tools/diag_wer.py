@@ -1,18 +1,28 @@
-import torch, numpy as np
-from src.dataset import NeuralToEmbeddingDataset, N_CTX, EMB_DIM
-from src.model import ConvBiGRU
+import sys
 
-device = "cpu"
-ck = torch.load("/tmp/diag_best.pt", map_location=device, weights_only=False)
+import numpy as np
+import torch
+
+from src.data.dataset import NeuralEmbeddingDataset
+from src.model.model import ConvBiGRU
+
+# usage: python -m tools.diag_wer [ckpt] [device] [n_trials]
+ckpt_path = sys.argv[1] if len(sys.argv) > 1 else "checkpoints/best.pt"
+device = sys.argv[2] if len(sys.argv) > 2 else "cpu"
+n_trials = int(sys.argv[3]) if len(sys.argv) > 3 else 12
+
+ck = torch.load(ckpt_path, map_location=device, weights_only=False)
 a = ck["args"]
 print("ckpt epoch:", ck.get("epoch"), "| gru_layers:", a.get("gru_layers"), "| best_val:", ck.get("best_val"))
 
-model = ConvBiGRU(conv_channels=a.get("conv_channels",256), hidden=a["hidden"],
-                  gru_layers=a["gru_layers"], dropout=a["dropout"]).to(device)
+model = ConvBiGRU(neural_dim=a.get("neural_dim", 512),
+                  conv_channels=a.get("conv_channels", 256), hidden=a["hidden"],
+                  gru_layers=a["gru_layers"], emb_dim=a.get("emb_dim", 384),
+                  n_ctx=a.get("n_ctx", 1500), dropout=a["dropout"]).to(device)
 model.load_state_dict(ck["model"]); model.eval()
 
-ds = NeuralToEmbeddingDataset(a["raw_dir"], a["features_dir"], "val")
-N = 12
+ds = NeuralEmbeddingDataset(a["raw_dir"], a["features_dir"], "val")
+N = n_trials
 preds, targs = [], []
 with torch.no_grad():
     for i in range(N):

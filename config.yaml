@@ -1,8 +1,11 @@
 
-# The raw HDF5 dataset and pre-extracted Whisper features live in the shared
-# NJEM project and are read-only from here. Anything this project WRITES
-# (stats cache, generated audio, features, checkpoints, results) stays local so
-# the NJEM copy is never modified.
+# ── Model-independent pipeline dimensions (shared by train + decode) ──
+# emb_dim is NOT set here: it depends on the Whisper model and is derived from
+# the `model` field automatically (tiny.en=384, base.en=512, small.en=768).
+dims: &dims
+  n_ctx: 1500           # Whisper encoder frames (same for tiny/base/small)
+  neural_dim: 512       # neural features per 20 ms bin
+  frame_samples: 320    # 16 kHz audio samples per encoder frame
 
 workflow:
   steps:
@@ -12,56 +15,53 @@ workflow:
 
 # ── Stage 1: Audio Generation (StyleTTS2) ───────────────────
 generate_audio:
-  data_dir: /raid/owais/home/work/NJEM/data/raw/hdf5_data_final   # read-only input
-  output_dir: data/generated_audio                                # local write
+  data_dir: data/raw/hdf5_data_final
+  output_dir: data/generated_audio
   split: train                # "train" or "val"
   num_workers: 4
   threads_per_worker: 1
 
 # ── Stage 2: Whisper Feature Extraction ─────────────────────
+# One run extracts features for every model listed below, writing each set to
+# its own folder: data/features/<model>/<split>/<session>/...
 extract_features:
-  audio_dir: data/generated_audio        # local (produced by Stage 1)
-  output_dir: data/features              # local write
-  num_workers: 8
-  threads_per_worker: 2
+  audio_dir: data/generated_audio
+  output_dir: data/features
+  models: [tiny.en, base.en, small.en]   # Whisper targets to extract
+  num_workers: 4
+  threads_per_worker: 1
 
 # ── Stage 3: Training ──────────────────────────────────────
+# Train ONE model per run. Set `model` to pick the Whisper target; emb_dim, the
+# feature folder (features_dir/<model>) and the checkpoint folder
+# (ckpt_dir/<model>) are all derived from it, so the three sizes never collide.
 train:
-  raw_dir: /workspace/work/NJEM/data/raw/hdf5_data_final   # read-only input
-  features_dir: /workspace/work/NJEM/data/features         # read-only input
-  stats_dir: data_cache/session_stats   # LOCAL normalization cache (not shared with NJEM)
+  <<: *dims
+  model: tiny.en            # tiny.en | base.en | small.en
+  raw_dir: data/raw/hdf5_data_final
+  features_dir: data/features   # base dir; the <model> subfolder is appended
   epochs: 1000
   batch_size: 64
   lr: 3.0e-4
   weight_decay: 1.0e-3      # stronger L2 to fight the train/val gap (was 1e-4)
-  num_workers: 2
-  # ── model architecture (all ablatable; override per run, e.g.
-  #    `python main.py train --rnn_type lstm --bidirectional false
-  #     --ckpt_dir checkpoints/abl_lstm`) ──
+  num_workers: 8          # DataLoader workers (persist across epochs)
+  prefetch_factor: 4      # batches each worker stages ahead of the GPU
   conv_channels: 256
-  conv_layers: 2            # number of stride-2 conv blocks (time subsample = 2^L)
-  conv_kernel: 5            # conv kernel size
-  rnn_type: gru             # temporal model: gru | lstm | none
   hidden: 256
-  rnn_layers: 3             # GRU/LSTM depth (alias of the old gru_layers)
-  bidirectional: true       # bi- vs uni-directional RNN
-  aligner: attn             # length aligner: attn (cross-attn) | interp (interpolation)
-  attn_heads: 4             # heads for the cross-attention aligner
-  head_layers: 2            # MLP regression-head depth
+  gru_layers: 3             # smaller temporal model — 8 layers memorised (was 8)
   dropout: 0.3              # back to the model's design default (was 0.1)
-  # ── loss term weights (set to 0 to ablate a term) ──
-  l1_weight: 1.0            # SmoothL1 embedding-regression weight
-  cos_weight: 1.0           # (1 - cosine) weight
-  dec_loss_weight: 0.8      # decoder-in-the-loop loss weight (0 = off; try 0.5-1.0)
-  dec_distill_weight: 0.5   # within the decoder loss, blend of soft KL vs hard CE (0=CE only, 1=KL only)
-  dec_temperature: 2.0      # softmax temperature for the distillation KL
-  dec_ramp_epochs: 20       # linearly ramp the decoder-loss weight 0->dec_loss_weight over N epochs (0=off)
-  dec_model: tiny.en        # frozen Whisper model used for the decoder loss
-  ckpt_dir: checkpoints
-  early_stop_patience: 10   # stop if val loss doesn't improve for N epochs (0 = off)
-  wer_every: 5              # run WER eval every N epochs (0 = off)
-  wer_trials: 1425          # honest WER estimate for checkpoint selection (was 30)
-  wer_out_dir: results/wer_eval   # per-validation CSVs: per-trial + per-session WER
+  session_adapt: linear     # per-session (day-specific) input layer to absorb
+                            # cross-session drift: linear (per-day W+b, most
+                            # expressive) | affine (per-day scale+bias, lighter) |
+                            # none (no session conditioning). Identity-initialised.
+
+  dec_loss_weight: 0.8      # decoder-in-the-loop CE loss weight (0 = off; try 0.5-1.0)
+
+  ckpt_dir: checkpoints     # base dir; the <model> subfolder is appended
+  wer_every: 20             # run WER eval every N epochs (0 = off)
+  wer_trials: 1450          # honest WER estimate for checkpoint selection (was 30)
+  patience: 20              # stop if val loss hasn't improved for this many epochs (0 = off)
+  
   # ── neural-input regularisation (dataset.py) ──
   normalize: true           # per-session, per-channel z-scoring of neural input
   augment: true             # train-only augmentation (noise / channel-drop / scale / jitter)
@@ -70,18 +70,19 @@ train:
   aug_scale: 0.1            # amplitude jitter: multiply by 1 +/- this
   aug_time_jitter: 2        # random temporal shift in bins (+/-)
   limit: 0                  # cap trials per split for debugging (0 = no cap)
-  seed: 42                  # RNG seed for reproducible runs
   device: auto                # "auto", "cuda", or "cpu"
 
 # ── Stage 4: Decoding / WER evaluation ─────────────────────
 decode:
-  ckpt: checkpoints/best_wer.pt   # checkpoint to decode with
+  <<: *dims
+  # Everything model-specific (which Whisper decoder, emb_dim, the <model>
+  # feature subfolder) is read from the checkpoint's saved args, so just point
+  # `ckpt` at the run you want to score.
+  ckpt: checkpoints/tiny.en_gru3_h256_conv256_drop0.3_lr3e-04_wd1e-03_bs64_sadapt-linear_decw0.8_norm1_aug1/best_wer.pt   # checkpoint to decode with
   split: val                      # "train" or "val"
-  raw_dir: /workspace/work/NJEM/data/raw/hdf5_data_final   # read-only input
-  features_dir: /workspace/work/NJEM/data/features         # read-only input
-  stats_dir: data_cache/session_stats   # LOCAL normalization cache (must match train)
-  beam_size: 5                    # beam width (1 = greedy)
-  dec_model: tiny.en              # frozen Whisper model for decoding
+  raw_dir: data/raw/hdf5_data_final
+  features_dir: data/features     # base dir; the <model> subfolder is appended
+  beam_size: 3                    # beam width (1 = greedy)
   limit: 0                        # cap trials (0 = decode all)
   out: results/val_wer.csv        # per-trial WER output CSV
   device: auto                    # "auto", "cuda", or "cpu"

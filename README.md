@@ -1,208 +1,134 @@
-# Brain2Text — Neural Joint Embedding Model (NJEM)
+# NJEM — Neural-to-Speech Decoding
 
-Decode text from intracortical neural activity by mapping neural signals into
-the embedding space of OpenAI **Whisper** and letting Whisper's frozen decoder
-turn those embeddings into words.
+Turn recorded brain activity into text. The pipeline learns to predict what a
+person was trying to say directly from their neural signals, then reads the
+prediction out as words using OpenAI's Whisper speech model.
 
-Instead of predicting characters/phonemes directly, the model learns to
-regress the **Whisper encoder embeddings** that a spoken version of each
-sentence would produce. Decoding then reuses Whisper's pretrained decoder,
-so the language knowledge in Whisper is leveraged for free.
+## The idea in one picture
 
 ```
-neural activity ──► ConvBiGRU ──► Whisper-encoder embeddings ──► [frozen Whisper decoder] ──► text
-   (B, T, 512)                        (B, 1500, 384)                                             + WER
+neural activity ──► ConvBiGRU model ──► Whisper embeddings ──► Whisper decoder ──► text
+   (what we                (what we           (a compact             (frozen,
+    record)                 train)             "sound fingerprint")   off-the-shelf)
 ```
 
----
+We never generate audio at prediction time. Instead the model learns to output
+the *embeddings* that Whisper's audio encoder would have produced for the spoken
+sentence. Whisper's decoder then turns those embeddings into words. Because
+Whisper is frozen and already excellent at going from embeddings to text, the
+only thing we have to train is the small model that maps neural signals to
+embeddings.
 
-## How it works
+## How the training targets are made
 
-The pipeline has four stages, orchestrated by `main.py` and driven by
-`config.yaml`:
+We don't have real audio for every trial, so we build it:
 
-| Stage | Module | What it does |
-|-------|--------|--------------|
-| 1. `generate_audio` | `src/audio_generator.py` | Synthesize speech audio for each trial's transcription with **StyleTTS2**. |
-| 2. `extract_features` | `src/whisper_features.py` | Run the synthesized audio through **Whisper** and cache the encoder embeddings (the regression targets). |
-| 3. `train` | `src/train_neural2emb.py` | Train the `ConvBiGRU` to map neural features → Whisper encoder embeddings. |
-| 4. `decode` | `src/decode.py` | Feed predicted embeddings to the frozen Whisper decoder and measure **WER**. |
+1. **Generate audio** — take each trial's ground-truth transcription and
+   synthesise speech for it with a text-to-speech model (StyleTTS2).
+2. **Extract features** — run that audio through Whisper's frozen encoder and
+   save the resulting embedding. This embedding is the target the model learns
+   to reproduce from neural data.
 
-Stages 1–2 produce the training targets and only need to be run once; stages
-3–4 are the model training and evaluation.
+## Multiple Whisper sizes
 
-### Dimensions
+You can target different Whisper encoders (`tiny.en` = 384-dim embeddings,
+`base.en` = 512, `small.en` = 768). One `extract_features` run produces a
+separate feature set for every model listed in the config, each in its own
+folder:
 
-- **Neural input:** `(T, 512)` — 512 channels per 20 ms bin.
-- **Target / prediction:** `(≤1500, 384)` — Whisper `tiny.en` encoder frames × hidden size.
+```
+data/features/<model>/<split>/<session>/whisper_features_<split>.hdf5
+checkpoints/<model>/best_wer.pt
+```
 
-### The model (`src/model.py`, `ConvBiGRU`)
+Training picks **one** model per run via the `model` field; its embedding size,
+feature folder, and checkpoint folder are all derived from that one choice, so
+the sizes never collide or get mismatched.
 
-1. **Conv front-end** — stride-2 conv blocks subsample the neural sequence in time.
-2. **Recurrent core** — a (bi)GRU/LSTM models temporal dynamics over packed sequences.
-3. **Length aligner** — cross-attention with learnable queries (or interpolation) maps the variable-length sequence to the target frame count.
-4. **Regression head** — an MLP predicts the 384-dim embedding per frame.
+## Pipeline stages
 
-Every component is configurable, so the architecture can be ablated (see below).
+| Stage | Command | What it does |
+|-------|---------|--------------|
+| 1. Generate audio | `python main.py generate_audio` | Transcription → speech audio (16 kHz) |
+| 2. Extract features | `python main.py extract_features` | Audio → Whisper encoder embeddings, one set per model |
+| 3. Train | `python main.py train` | Learn neural → embeddings for the selected `model` |
+| 4. Decode | `python main.py decode` | Decode a split to text, score WER |
 
-### Training objective (`src/train_neural2emb.py`)
+Run everything in order with `python main.py workflow`.
 
-The loss combines several terms, each individually weightable (set a weight to 0
-to disable it):
+## Configuration
 
-- **Embedding regression** — masked SmoothL1 + `(1 − cosine similarity)` over the valid (content) frames (`l1_weight`, `cos_weight`).
-- **Decoder-in-the-loop loss** (`src/decoder_loss.py`, `dec_loss_weight`) — runs predictions through the *frozen* Whisper decoder, teacher-forced on the ground-truth transcription. This directly optimizes *decodability* → WER, and itself blends:
-  - **hard cross-entropy** against the ground-truth tokens, and
-  - **soft KL distillation** (`dec_distill_weight`, `dec_temperature`) — the same decoder is also run on the *target* (real-audio) embeddings to get a teacher distribution, and the student is pulled towards it. This trains the model so the decoder *behaves* as it does on real audio rather than forcing exact embedding values.
-- **Decoder-weight ramp** (`dec_ramp_epochs`) — the decoder-loss weight is linearly ramped 0 → `dec_loss_weight` over the first N epochs, so embedding regression warms the model up before the decoder objective takes over. (Validation always uses the full weight, so the early-stopping metric stays comparable across epochs.)
-
-Additional training machinery:
-
-- **Per-session normalization** — neural input is z-scored per channel using statistics computed **only from each session's training split** (no val leakage). Cached to `stats_dir`.
-- **Augmentation** (train only) — Gaussian noise, channel dropout, amplitude jitter, and temporal jitter on the neural input.
-- **Early stopping** — training stops if validation loss does not improve for `early_stop_patience` epochs (default 10).
-- **Checkpointing** — `best.pt` (best val loss), `best_wer.pt` (best WER), and `last.pt` (latest, for resume) are written to `ckpt_dir`. Runs auto-resume from `last.pt`/`best.pt` if present.
-
----
-
-## Installation
+Every setting lives in **`config.yaml`** — there are no command-line flags to
+remember. Each stage has its own section. To change a run, edit the file (or copy
+it) and pass it in:
 
 ```bash
-pip install -r requirements.txt
+python main.py train              # uses config.yaml
+python main.py train my_run.yaml  # uses a different config
 ```
 
-Key dependencies: `torch`, `openai-whisper`, `styletts2`, `h5py`, `librosa`,
-`numpy`, `PyYAML`, `tqdm`. A CUDA-capable GPU is strongly recommended for
-training (`device: auto` falls back to CPU).
+The model-independent dimensions (`n_ctx`, `neural_dim`, `frame_samples`) are
+defined once at the top and reused by the train and decode sections via a YAML
+anchor. The embedding size (`emb_dim`) is **not** set by hand — it is derived
+automatically from the chosen Whisper `model`.
 
-## Data layout
+## Code map (`src/`)
 
-The raw dataset is per-session HDF5 files (participant `t15`, one directory per
-recording day):
+Modules are grouped by pipeline role:
 
-```
-<raw_dir>/<session>/data_{train,val,test}.hdf5     # neural input_features + transcriptions
-<features_dir>/<split>/<session>/whisper_features_<split>.hdf5   # cached Whisper encoder embeddings
-```
+| Folder / file | Responsibility |
+|---------------|----------------|
+| **`pipeline/`** | Offline data preparation stages |
+| `pipeline/audio.py` | Stage 1 — synthesise speech from transcriptions (StyleTTS2, multiprocess) |
+| `pipeline/features.py` | Stage 2 — audio → frozen-Whisper encoder embeddings (multiprocess) |
+| **`data/`** | Training-time data handling |
+| `data/dataset.py` | Pair each neural recording with its embedding target; batch/pad (`collate`) |
+| `data/preprocessing.py` | Per-session z-score normalization + train-only augmentation |
+| **`model/`** | The network and its losses |
+| `model/model.py` | `ConvBiGRU`: neural → embeddings (conv → Bi-GRU → cross-attention → MLP) |
+| `model/losses.py` | Embedding regression loss + optional decoder-in-the-loop loss |
+| **`training/`** | Optimisation and evaluation |
+| `training/train.py` | The training loop, checkpointing, and periodic WER checks |
+| `training/decode.py` | Load a checkpoint, decode a split with Whisper, write a per-trial CSV |
+| `training/metrics.py` | Word error rate |
+| **`utils/`** | Cross-cutting helpers |
+| `utils/config.py` | Load `config.yaml`; hand each stage its settings; resolve `device: auto`; map a Whisper model to its `emb_dim` |
+| `utils/logging_utils.py` | Per-module logging to `logs/<name>.log` and the console |
 
-Paths are set in `config.yaml`. The raw data and features are treated as
-**read-only inputs** (they may live in a shared location); everything the
-project writes — the normalization cache (`stats_dir`), checkpoints, and
-results — stays local.
+## The model (`ConvBiGRU`)
 
----
+Four stages, in order:
 
-## Quickstart
+1. **Conv front-end** — two stride-2 convolutions smooth and downsample the
+   neural signal ~4× in time.
+2. **Bi-GRU** — models temporal dynamics in both directions. Padding is handled
+   with packed sequences so it never affects the outputs.
+3. **Cross-attention** — a fixed bank of learnable "query" frames pulls out
+   exactly the number of embedding frames we need.
+4. **MLP head** — regresses the final embedding for each frame.
 
-Run the full pipeline, or any single stage:
+## Two training losses
 
-```bash
-python main.py workflow            # run the stages listed under workflow.steps
-python main.py generate_audio      # stage 1
-python main.py extract_features    # stage 2
-python main.py train               # stage 3
-python main.py decode              # stage 4
-```
+* **Embedding loss** (always on) — SmoothL1 + `(1 − cosine)` between predicted
+  and target embeddings, measured only over frames that contain real content.
+* **Decoder-in-the-loop loss** (optional, `dec_loss_weight > 0`) — runs the
+  predicted embeddings through Whisper's frozen *decoder* and measures how well
+  it recovers the true transcription. This optimises decodability directly,
+  which is what actually lowers WER.
 
-Override any config value on the command line (a flag exists for every key):
+## Checkpoints
 
-```bash
-python main.py train --epochs 200 --batch_size 64 --device cuda
-python main.py --config my_config.yaml train
-python main.py decode --ckpt checkpoints/best_wer.pt --split val --beam_size 5
-```
+Written to `checkpoints/<model>/` during training:
 
----
+* `best.pt` — lowest validation loss so far
+* `best_wer.pt` — lowest word error rate so far (from the periodic WER check)
+* `last.pt` — the latest epoch (training auto-resumes from here)
 
-## Configuration (`config.yaml`)
+Each checkpoint stores the full training config, so decoding rebuilds the exact
+model without you having to repeat any settings.
 
-Grouped by stage. Notable `train` keys:
+## Requirements
 
-| Key | Meaning |
-|-----|---------|
-| `raw_dir`, `features_dir` | read-only data inputs |
-| `stats_dir` | local dir for the per-session normalization cache |
-| `epochs`, `batch_size`, `lr`, `weight_decay` | optimization |
-| `early_stop_patience` | stop after N epochs without val-loss improvement (0 = off) |
-| `conv_channels`, `conv_layers`, `conv_kernel` | conv front-end |
-| `rnn_type` (`gru`/`lstm`/`none`), `hidden`, `rnn_layers`, `bidirectional` | recurrent core |
-| `aligner` (`attn`/`interp`), `attn_heads`, `head_layers` | length aligner + head |
-| `dropout`, `normalize`, `augment`, `aug_*` | regularization / augmentation |
-| `l1_weight`, `cos_weight`, `dec_loss_weight` | loss-term weights |
-| `dec_distill_weight`, `dec_temperature` | soft-KL vs hard-CE blend + temperature inside the decoder loss |
-| `dec_ramp_epochs` | ramp the decoder-loss weight up over the first N epochs |
-| `dec_model` | frozen Whisper model for the decoder loss / decoding (`tiny.en`) |
-| `wer_every`, `wer_trials`, `beam_size` | in-training WER evaluation |
-| `wer_out_dir` | where per-epoch WER CSVs are written |
-| `seed`, `device` | reproducibility / device |
-
----
-
-## Outputs
-
-Training and decoding write:
-
-- **Checkpoints** → `ckpt_dir/` (`best.pt`, `best_wer.pt`, `last.pt`).
-- **Per-epoch WER CSVs** (during training, every `wer_every` epochs) → `wer_out_dir/`:
-  - `val_predictions_epoch*.csv` — `session, trial, actual, predicted, wer`
-  - `val_wer_per_session_epoch*.csv` — `session, wer, n_trials`
-- **Decode CSVs** → `decode.out` and `<out>_per_session.csv`.
-- **Logs** → `logs/<name>.log` (redirectable via `B2T_LOG_DIR` / `B2T_LOG_FILE`).
-
----
-
-## Ablation studies
-
-`tools/run_ablations.py` launches a grid of training runs that each change **one
-thing** from the `config.yaml` baseline, so effects are attributable. Results,
-checkpoints, and logs for each run are isolated under `results/ablations/`:
-
-```
-results/ablations/
-  logs/<run>.log
-  <run>/checkpoints/{best,best_wer,last}.pt
-  <run>/wer/val_predictions_epoch*.csv
-  <run>/wer/val_wer_per_session_epoch*.csv
-```
-
-The grid spans these axes (`--group`): `augment`, `temporal`, `aligner`,
-`conv`, `capacity`, `reg`, `loss`, `optim`, `combo`, plus the `baseline`.
-
-```bash
-# print the full "changed from baseline" config table without running
-python tools/run_ablations.py --dry-run
-
-# run one axis, or specific runs
-python tools/run_ablations.py --group loss
-python tools/run_ablations.py --only baseline no_aug rnn_lstm
-
-# quick CPU smoke test (tiny; proves the grid runs)
-python tools/run_ablations.py --limit 8 --batch_size 4 --epochs 1 \
-    --wer_every 1 --wer_trials 8 --device cpu
-```
-
-Common flags: `--python` (interpreter to use), `--epochs`, `--batch_size`,
-`--num_workers`, `--limit`, `--device`, `--wer_every`, `--wer_trials`, `--seed`.
-
----
-
-## Project layout
-
-```
-main.py                     # unified CLI entry point (stages + workflow)
-config.yaml                 # all stage configuration
-src/
-  audio_generator.py        # stage 1: StyleTTS2 audio synthesis
-  whisper_features.py       # stage 2: Whisper encoder-embedding extraction
-  dataset.py                # neural↔embedding pairing, normalization, augmentation
-  model.py                  # ConvBiGRU + build_model + losses
-  decoder_loss.py           # decoder-in-the-loop CE loss
-  train_neural2emb.py       # training loop, WER eval, early stopping
-  decode.py                 # beam-search decoding + WER reports
-  utils.py                  # config loading + logging
-tools/
-  run_ablations.py          # ablation-study runner
-checkpoints/                # model checkpoints (gitignored)
-results/                    # predictions, WER CSVs, ablation outputs (gitignored)
-logs/                       # run logs (gitignored)
-```
+Python 3 with `torch`, `h5py`, `numpy`, `openai-whisper`, `librosa`,
+`styletts2`, `pyyaml`, and `tqdm`. A GPU is used automatically when available
+(`device: auto`).

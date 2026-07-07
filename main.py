@@ -1,107 +1,40 @@
-"""
-NJEM – Neural Joint Embedding Model
-====================================
-Unified entry-point driven by config.yaml.
+"""NJEM – neural-to-speech decoding pipeline.
 
-    python main.py workflow                        # run full pipeline
-    python main.py generate_audio                  # single stage
-    python main.py train                           # single stage
-    python main.py train --epochs 50 --device cpu  # override config values
-    python main.py --config my_config.yaml train   # use a different config
-"""
+Everything is driven by ``config.yaml``. Pick one stage (or run the whole
+workflow) from the command line; all settings come from the config file.
 
-import argparse
+    python main.py workflow            # run every step in config's workflow.steps
+    python main.py generate_audio      # stage 1: transcription -> speech audio
+    python main.py extract_features    # stage 2: audio -> Whisper embeddings
+    python main.py train               # stage 3: neural -> embeddings model
+    python main.py decode              # stage 4: decode a split, write WER CSV
+    python main.py train my.yaml       # use a different config file
+"""
 import sys
-from argparse import Namespace
-from pathlib import Path
 
-import torch
-import yaml
+from src.utils.config import load_config, resolve_device, stage_config
 
 
-# ── Helpers ─────────────────────────────────────────────────────────
-
-def load_config(path: str = "config.yaml") -> dict:
-    with open(path) as f:
-        return yaml.safe_load(f)
+def run_generate_audio(cfg):
+    from src.pipeline.audio import generate_audio
+    generate_audio(cfg)
 
 
-def resolve_device(value: str) -> str:
-    if value == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    return value
+def run_extract_features(cfg):
+    from src.pipeline.features import extract_features
+    extract_features(cfg)
 
 
-def merge_cli_overrides(cfg, overrides):
-    """Parse --key value pairs from the remaining CLI args into *cfg*."""
-    parser = argparse.ArgumentParser(add_help=False)
-    for key, val in cfg.items():
-        arg_type = type(val) if val is not None else str
-        if isinstance(val, bool):
-            parser.add_argument(f"--{key}", type=lambda v: v.lower() in ("true", "1", "yes"), default=val)
-        else:
-            parser.add_argument(f"--{key}", type=arg_type, default=val)
-    parsed, _ = parser.parse_known_args(overrides)
-    cfg.update(vars(parsed))
-    return cfg
+def run_train(cfg):
+    from src.training.train import train
+    cfg.device = resolve_device(cfg.device)
+    train(cfg)
 
 
-# ── Stage runners ───────────────────────────────────────────────────
-
-def run_generate_audio(cfg: dict):
-    from src.audio_generator import AudioGeneratorWorker
-
-    print(f"\n{'=' * 60}")
-    print("Stage: generate_audio")
-    print(f"{'=' * 60}")
-
-    generator = AudioGeneratorWorker(
-        num_workers=cfg["num_workers"],
-        threads_per_worker=cfg["threads_per_worker"],
-    )
-    generator.generate_from_hdf5(
-        data_dir=cfg["data_dir"],
-        output_dir=cfg["output_dir"],
-        split=cfg["split"],
-    )
-
-
-def run_extract_features(cfg: dict):
-    from src.whisper_features import WhisperEEGFeatureExtractor
-
-    print(f"\n{'=' * 60}")
-    print("Stage: extract_features")
-    print(f"{'=' * 60}")
-
-    extractor = WhisperEEGFeatureExtractor(
-        audio_dir=cfg["audio_dir"],
-        output_dir=cfg["output_dir"],
-        num_workers=cfg["num_workers"],
-        threads_per_worker=cfg["threads_per_worker"],
-    )
-    extractor.generate_features()
-
-
-def run_train(cfg: dict):
-    from src.train_neural2emb import train
-
-    print(f"\n{'=' * 60}")
-    print("Stage: train")
-    print(f"{'=' * 60}")
-
-    cfg["device"] = resolve_device(cfg["device"])
-    train(Namespace(**cfg))
-
-
-def run_decode(cfg: dict):
-    from src.decode import decode
-
-    print(f"\n{'=' * 60}")
-    print("Stage: decode")
-    print(f"{'=' * 60}")
-
-    cfg["device"] = resolve_device(cfg["device"])
-    decode(Namespace(**cfg))
+def run_decode(cfg):
+    from src.training.decode import decode_split
+    cfg.device = resolve_device(cfg.device)
+    decode_split(cfg)
 
 
 STAGES = {
@@ -112,40 +45,29 @@ STAGES = {
 }
 
 
-# ── CLI ─────────────────────────────────────────────────────────────
+def _run(stage, config):
+    print(f"\n{'=' * 60}\nStage: {stage}\n{'=' * 60}")
+    STAGES[stage](stage_config(config, stage))
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Neural Joint Embedding Model",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument(
-        "--config", default="config.yaml",
-        help="Path to the YAML configuration file (default: config.yaml)",
-    )
-    parser.add_argument(
-        "command",
-        choices=list(STAGES.keys()) + ["workflow"],
-        help="Pipeline stage to run, or 'workflow' for the full pipeline",
-    )
+    commands = list(STAGES) + ["workflow"]
+    if len(sys.argv) < 2 or sys.argv[1] not in commands:
+        print(f"usage: python main.py <{'|'.join(commands)}> [config.yaml]")
+        sys.exit(1)
 
-    args, remaining = parser.parse_known_args()
-    config = load_config(args.config)
+    command = sys.argv[1]
+    config = load_config(sys.argv[2] if len(sys.argv) > 2 else "config.yaml")
 
-    if args.command == "workflow":
-        steps = config.get("workflow", {}).get("steps", list(STAGES.keys()))
+    if command == "workflow":
+        steps = config.get("workflow", {}).get("steps", list(STAGES))
         for step in steps:
-            if step not in STAGES:
-                print(f"Unknown workflow step '{step}', skipping.")
-                continue
-            stage_cfg = dict(config.get(step, {}))
-            stage_cfg = merge_cli_overrides(stage_cfg, remaining)
-            STAGES[step](stage_cfg)
+            if step in STAGES:
+                _run(step, config)
+            else:
+                print(f"unknown workflow step '{step}', skipping")
     else:
-        stage_cfg = dict(config.get(args.command, {}))
-        stage_cfg = merge_cli_overrides(stage_cfg, remaining)
-        STAGES[args.command](stage_cfg)
+        _run(command, config)
 
 
 if __name__ == "__main__":
