@@ -82,7 +82,7 @@ decode:
   split: val                      # "train" or "val"
   raw_dir: data/raw/hdf5_data_final
   features_dir: data/features     # base dir; the <model> subfolder is appended
-  beam_size: 3                    # beam width (1 = greedy)
+  beam_size: 5                    # beam width (1 = greedy)
   limit: 0                        # cap trials (0 = decode all)
   out: results/val_wer.csv        # per-trial WER output CSV
   device: auto                    # "auto", "cuda", or "cpu"
