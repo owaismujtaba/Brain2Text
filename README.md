@@ -1,4 +1,4 @@
-# NJEM — Neural-to-Speech Decoding
+## Neural-to-Speech Decoding
 
 Turn recorded brain activity into text. The pipeline learns to predict what a
 person was trying to say directly from their neural signals, then reads the
